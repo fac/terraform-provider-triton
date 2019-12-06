@@ -293,6 +293,27 @@ func resourceMachine() *schema.Resource {
 	}
 }
 
+func constructNetworkObject(network_string string) (compute.NetworkObject, error) {
+	network := compute.NetworkObject{}
+
+	network_strings := strings.SplitN(network_string, "?", 2)
+	network.IPv4UUID = network_strings[0]
+	// bit of a hack, but if the string contains ?ip=<ip> then we
+	// break this out and add it to the IPv4IPs array (comma separated)
+	if len(network_strings) == 2 {
+		// only support ip=<ip> for now
+		params := network_strings[1]
+
+		if len(params) < 4 || params[0:3] != "ip=" {
+			return network, fmt.Errorf("networks only support the 'ip' parameter")
+		} else {
+			network.IPv4IPs = strings.Split(params[3:], ",")
+		}
+	}
+
+	return network, nil
+}
+
 func resourceMachineCreate(d *schema.ResourceData, meta interface{}) error {
 	client := meta.(*Client)
 	c, err := client.Compute()
@@ -310,10 +331,16 @@ func resourceMachineCreate(d *schema.ResourceData, meta interface{}) error {
 		defer client.affinityLock.Unlock()
 	}
 
-	var networks []string
-	for _, network := range d.Get("networks").([]interface{}) {
-		networks = append(networks, network.(string))
+	var networkObjects []compute.NetworkObject
+	for _, network_uuid := range d.Get("networks").([]interface{}) {
+		network, error := constructNetworkObject(network_uuid.(string))
+		if error != nil {
+			return error
+		}
+		networkObjects = append(networkObjects, network)
 	}
+
+	log.Printf("[DEBUG] Constructed network objects: %+v", networkObjects)
 
 	metadata := map[string]string{}
 	for k, v := range d.Get("metadata").(map[string]interface{}) {
@@ -357,7 +384,7 @@ func resourceMachineCreate(d *schema.ResourceData, meta interface{}) error {
 		Name:            d.Get("name").(string),
 		Package:         d.Get("package").(string),
 		Image:           d.Get("image").(string),
-		Networks:        networks,
+		NetworkObjects:  networkObjects,
 		Metadata:        metadata,
 		Affinity:        affinity,
 		Tags:            tags,
@@ -749,10 +776,18 @@ func resourceMachineUpdate(d *schema.ResourceData, meta interface{}) error {
 		n := nRaw.([]interface{})
 
 		networksToRemove := differenceNetworks(o, n)
+
 		for _, toRemove := range networksToRemove {
+			networkObject, err := constructNetworkObject(toRemove)
+			if err != nil {
+				return err
+			}
+
 			var macId string
 			for _, nic := range nics {
-				if nic.Network == toRemove {
+				// the CloudAPI appears to prevent multiple NICs attached to the same
+				// network, so we'll just match on the same network UUID
+				if nic.Network == networkObject.IPv4UUID {
 					macId = nic.MAC
 					break
 				}
@@ -767,15 +802,49 @@ func resourceMachineUpdate(d *schema.ResourceData, meta interface{}) error {
 				if err != nil {
 					return err
 				}
+				stateConf := &resource.StateChangeConf{
+					Target: []string{"removed"},
+					Refresh: func() (interface{}, string, error) {
+						n, _ := c.Instances().GetNIC(context.Background(), &compute.GetNICInput{
+							InstanceID: d.Id(),
+							MAC:        macId,
+						})
+						if err != nil {
+							if errors.IsSpecificError(err, "ResourceNotFound") {
+								return "removed", "removed", nil
+							} else {
+								return nil, "", err
+							}
+						} else {
+							if n == nil {
+								return "removed", "removed", nil
+							} else {
+								return nil, "not removed", nil
+							}
+						}
+					},
+					Timeout:    machineStateChangeTimeout,
+					MinTimeout: 3 * time.Second,
+				}
+				_, err = stateConf.WaitForState()
+				if err != nil {
+					return err
+				}
 			}
+			d.SetPartial("networks")
 		}
 
 		networksToAdd := differenceNetworks(n, o)
 		for _, toAdd := range networksToAdd {
 			log.Printf("[DEBUG] Adding NIC with Network %s", toAdd)
+			networkObject, err := constructNetworkObject(toAdd)
+			if err != nil {
+				return err
+			}
+
 			nic, err := c.Instances().AddNIC(context.Background(), &compute.AddNICInput{
-				InstanceID: d.Id(),
-				Network:    toAdd,
+				InstanceID:    d.Id(),
+				NetworkObject: networkObject,
 			})
 			if err != nil {
 				return err
