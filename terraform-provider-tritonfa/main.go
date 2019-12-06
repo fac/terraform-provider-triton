@@ -1,8 +1,8 @@
 package main
 
 import (
+	"github.com/fac/terraform-provider-triton/triton"
 	"github.com/hashicorp/terraform/plugin"
-	"github.com/terraform-providers/terraform-provider-triton/triton"
 )
 
 func main() {

@@ -6,7 +6,7 @@ PKG_NAME=triton
 default: build
 
 build: fmtcheck ## Build the provider
-	go install
+	cd terraform-provider-tritonfa && go install
 
 test: fmtcheck ## Test the provider
 	go test -i $(TEST) || exit 1
